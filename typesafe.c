@@ -34,10 +34,14 @@
 #include "utils/tuplestore.h"
 #include "varatt.h"
 
+#ifdef PG_MODULE_MAGIC_EXT
 PG_MODULE_MAGIC_EXT(
 					.name = "typesafe",
 					.version = "0.0.1"
 );
+#else
+PG_MODULE_MAGIC;
+#endif
 
 PG_FUNCTION_INFO_V1(typesafe_classify);
 PG_FUNCTION_INFO_V1(typesafe_detect);
@@ -68,7 +72,7 @@ static int	typesafe_http_concurrency = 4;
 /* Last POST body, allocated in TopMemoryContext. */
 static char *last_request_json = NULL;
 
-pg_noreturn static void json_shape_error(const char *detail);
+static void json_shape_error(const char *detail) pg_attribute_noreturn();
 static char *get_text_arg(FunctionCallInfo fcinfo, int argno, const char *name);
 static Jsonb *get_jsonb_arg(FunctionCallInfo fcinfo, int argno,
 							const char *name);
@@ -204,7 +208,7 @@ _PG_init(void)
 				 errmsg("could not initialize HTTP client")));
 }
 
-pg_noreturn static void
+static void
 json_shape_error(const char *detail)
 {
 	ereport(ERROR,

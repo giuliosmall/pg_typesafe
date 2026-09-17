@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 16 and libcurl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-16 \
+            postgresql-server-dev-16 \
+            libcurl4-openssl-dev \
+            pkg-config \
+            gcc \
+            make
+
+      - name: Build and install extension
+        run: |
+          make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+          sudo make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install
+
+      - name: Mock tests
+        run: |
+          sudo pg_ctlcluster 16 main start || true
+          sudo -u postgres createdb typesafe_ci
+          sudo -u postgres env PGHOST=/var/run/postgresql PGUSER=postgres PGDATABASE=typesafe_ci \
+            sh test/ci.sh

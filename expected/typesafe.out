@@ -64,6 +64,16 @@ SELECT * FROM typesafe_detect(
  0.92 | jev-latest |          312 |            48
 (1 row)
 
+SELECT typesafe_noul(
+	'Help! My payouts have been failing for 3 days.',
+	'Does this convey urgency?',
+	'Explicitly time-sensitive',
+	'No urgency expressed');
+ typesafe_noul 
+---------------
+          0.92
+(1 row)
+
 -- Score frustration (Score)
 SET typesafe.mock_response = $${
   "model": "jev-latest",
@@ -218,3 +228,12 @@ SELECT typesafe_classify(
 	'Which team should handle this?',
 	'{"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}'::jsonb);
 ERROR:  typesafe.api_key is not set
+-- EXECUTE is revoked from PUBLIC
+DROP ROLE IF EXISTS typesafe_nobody;
+NOTICE:  role "typesafe_nobody" does not exist, skipping
+CREATE ROLE typesafe_nobody NOLOGIN;
+SET SESSION AUTHORIZATION typesafe_nobody;
+SELECT typesafe_noul('x', 'y');
+ERROR:  permission denied for function typesafe_noul
+RESET SESSION AUTHORIZATION;
+DROP ROLE typesafe_nobody;

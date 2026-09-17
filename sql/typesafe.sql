@@ -51,6 +51,12 @@ SELECT * FROM typesafe_detect(
 	'Explicitly time-sensitive',
 	'No urgency expressed');
 
+SELECT typesafe_noul(
+	'Help! My payouts have been failing for 3 days.',
+	'Does this convey urgency?',
+	'Explicitly time-sensitive',
+	'No urgency expressed');
+
 -- Score frustration (Score)
 SET typesafe.mock_response = $${
   "model": "jev-latest",
@@ -179,3 +185,11 @@ SELECT typesafe_classify(
 	'Help! My payouts have been failing for 3 days.',
 	'Which team should handle this?',
 	'{"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}'::jsonb);
+
+-- EXECUTE is revoked from PUBLIC
+DROP ROLE IF EXISTS typesafe_nobody;
+CREATE ROLE typesafe_nobody NOLOGIN;
+SET SESSION AUTHORIZATION typesafe_nobody;
+SELECT typesafe_noul('x', 'y');
+RESET SESSION AUTHORIZATION;
+DROP ROLE typesafe_nobody;

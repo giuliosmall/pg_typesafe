@@ -1,80 +1,94 @@
 # pg_typesafe
 
-**Pre-pre-pre-alpha.** A PostgreSQL extension that calls [TypeSafe AI](https://console.typesafe.ai/home) (System One / Jev) from SQL for categorical work: Choice, Noul, and Score.
+[![ci](https://github.com/giuliosmall/pg_typesafe/actions/workflows/ci.yml/badge.svg)](https://github.com/giuliosmall/pg_typesafe/actions/workflows/ci.yml)
+
+**Pre-alpha.** A PostgreSQL extension that calls [TypeSafe AI](https://console.typesafe.ai/home) (System One / Jev) from SQL for categorical work: Choice, Noul, and Score.
 
 Not affiliated with TypeSafe AI or the PostgreSQL Global Development Group.
 
+Tested on **PostgreSQL 16 and 17**, libcurl 7.61+.
+
 ## Install
 
-Needs PostgreSQL 16+ (built with a C compiler) and libcurl 7.61+.
-
 ```bash
+git clone https://github.com/giuliosmall/pg_typesafe.git
+cd pg_typesafe
 make
-make install   # as a user who can write $libdir
+make install   # needs write access to pkglibdir (often sudo)
 ```
 
 ```sql
 CREATE EXTENSION typesafe;
 ```
 
+`EXECUTE` is revoked from `PUBLIC`. The owner (usually a superuser) can run the functions. To let an app role call them:
+
+```sql
+GRANT EXECUTE ON FUNCTION typesafe_noul(text, text, text, text, text) TO app;
+GRANT EXECUTE ON FUNCTION typesafe_detect_many(text[], text, text, text, text) TO app;
+```
+
 ## API key
 
-Do **not** put the key in SQL in production. Set it on the **server** process:
+Set `TYPESAFE_API_KEY` on the **Postgres server** process. Do not put it in SQL.
 
 ```bash
 export TYPESAFE_API_KEY=tsk_...
 pg_ctl restart
 ```
 
-Then queries contain no secret:
-
 ```sql
-SELECT * FROM typesafe_detect(
+SELECT typesafe_noul(
     'Help! My payouts have been failing for 3 days.',
     'Does this convey urgency?'
 );
 ```
 
-`SET typesafe.api_key = '...'` works for a session but shows up in query logs. Prefer the env var.
+`SET typesafe.api_key` works for a session but appears in query logs.
 
-## Functions
+## Demo (NYC 311)
 
-| Function | TypeSafe primitive | Use |
-|---|---|---|
-| `typesafe_classify` / `typesafe_label` | Choice | one category |
-| `typesafe_detect` | Noul | yes/no probability |
-| `typesafe_score` | Score | ordered rubric |
-| `typesafe_ask` | mixed | several questions, one request |
-| `typesafe_detect_many` / `typesafe_classify_many` / `typesafe_label_many` | batched | many texts, few HTTP round trips |
+From the repo root, with the key in the server environment:
 
-Scalars issue **one HTTP call per row**. For a table, pack distinct values:
-
-```sql
-WITH labels AS (
-    SELECT state AS resolution, noul AS no_access
-    FROM typesafe_detect_many(
-        ARRAY(SELECT DISTINCT resolution FROM complaints
-              WHERE resolution IS NOT NULL),
-        'Does this resolution say the condition could not be found?'
-    )
-)
-SELECT c.agency, count(*) 
-FROM complaints c
-JOIN labels l USING (resolution)
-WHERE l.no_access >= 0.8
-GROUP BY 1;
+```bash
+psql -d postgres -v ON_ERROR_STOP=1 -f examples/311.sql
 ```
 
-`typesafe.batch_size` (default 32) is how many texts share one TypeSafe request. Extra chunks overlap (`typesafe.http_concurrency`, default 4).
+1,000 closed NYC 311 complaints, **38 unique** resolution strings. `typesafe_detect_many` classifies those 38 in one TypeSafe request (not 1,000 HTTP calls).
 
-## Measured (laptop, live Jev)
-
-1,000 real NYC 311 complaints, 38 unique resolution texts:
+Measured on a laptop against live Jev:
 
 | Method | Time |
 |---|---|
 | `typesafe_detect` once per distinct text | 23 s |
 | `typesafe_detect_many` | 0.86 s |
+
+## Functions
+
+| Function | Primitive | Use |
+|---|---|---|
+| `typesafe_noul(text, text)` | Noul | yes/no probability (scalar) |
+| `typesafe_detect` | Noul | same, plus model / tokens |
+| `typesafe_classify` / `typesafe_label` | Choice | one category |
+| `typesafe_score` | Score | ordered rubric |
+| `typesafe_ask` | mixed | several questions, one request |
+| `typesafe_detect_many` / `typesafe_classify_many` | batched | many texts, few HTTP round trips |
+
+Scalars issue **one HTTP call per row**. For a table, batch distinct values:
+
+```sql
+SELECT resolution, typesafe_noul(resolution, 'Could the condition not be found?')
+FROM (SELECT DISTINCT resolution FROM complaints) s;
+
+-- Faster for a set:
+SELECT state AS resolution, noul
+FROM typesafe_detect_many(
+    ARRAY(SELECT DISTINCT resolution FROM complaints),
+    'Could the condition not be found?'
+);
+```
+
+`typesafe.batch_size` (default 32) is how many texts share one TypeSafe request. Extra chunks overlap (`typesafe.http_concurrency`, default 4).
 
 ## Tests without the network
 
@@ -87,11 +101,13 @@ SET typesafe.mock_response = $${
   "usage": {"input_tokens": 1, "output_tokens": 1}
 }$$;
 
-SELECT noul FROM typesafe_detect('anything', 'Is this urgent?');
+SELECT typesafe_noul('anything', 'Is this urgent?');
 ```
+
+Mock regression: `sql/typesafe.sql` / `expected/typesafe.out`.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
 
-Docs: [TypeSafe API](https://docs.typesafe.ai/api) · [Choice](https://docs.typesafe.ai/primitives/choice)
+[TypeSafe API](https://docs.typesafe.ai/api) · [Choice](https://docs.typesafe.ai/primitives/choice)

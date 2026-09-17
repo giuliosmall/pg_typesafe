@@ -1,4 +1,4 @@
-/* contrib/typesafe/typesafe--1.0.sql */
+/* pg_typesafe — typesafe--0.0.1.sql */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION typesafe" to load this file. \quit
@@ -145,3 +145,34 @@ AS $$
 	SELECT ordinality, state, choice
 	FROM typesafe_classify_many(states, instructions, options, model);
 $$ LANGUAGE SQL VOLATILE PARALLEL UNSAFE;
+
+CREATE FUNCTION typesafe_noul(
+	state text,
+	instructions text,
+	true_meaning text DEFAULT NULL,
+	false_meaning text DEFAULT NULL,
+	model text DEFAULT NULL
+)
+RETURNS double precision
+AS $$
+	SELECT noul
+	FROM typesafe_detect(state, instructions, true_meaning, false_meaning, model);
+$$ LANGUAGE SQL VOLATILE PARALLEL UNSAFE;
+
+-- Outbound HTTP spends the server's TypeSafe quota. Owner only by default.
+-- GRANT EXECUTE ON FUNCTION typesafe_noul(text, text, text, text, text) TO app;
+DO $$
+DECLARE
+	r record;
+BEGIN
+	FOR r IN
+		SELECT p.oid::regprocedure AS sig
+		FROM pg_proc p
+		JOIN pg_extension e ON e.extname = 'typesafe'
+		WHERE p.proname LIKE 'typesafe\_%' ESCAPE '\'
+		  AND p.pronamespace = e.extnamespace
+	LOOP
+		EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', r.sig);
+	END LOOP;
+END
+$$;
