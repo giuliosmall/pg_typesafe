@@ -23,8 +23,8 @@ jobs:
 
       - name: Build and install extension
         run: |
-          make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
-          sudo make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install
+          make with_llvm=no PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+          sudo make with_llvm=no PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install
 
       - name: Mock tests
         run: |
