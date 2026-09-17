@@ -1,0 +1,5 @@
+# typesafe extension
+comment = 'TypeSafe AI client for categorical classification'
+default_version = '0.0.1'
+module_pathname = '$libdir/typesafe'
+relocatable = true

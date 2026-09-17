@@ -1,0 +1,220 @@
+--
+-- typesafe
+--
+CREATE EXTENSION typesafe;
+-- Classify a support ticket (Choice)
+SET typesafe.mock_response = $${
+  "model": "jev-latest",
+  "answers": {
+    "label": {
+      "type": "choice",
+      "choice": "technical",
+      "confidence": 0.82,
+      "probabilities": {
+        "billing": 0.08,
+        "technical": 0.85,
+        "sales": 0.07
+      }
+    }
+  },
+  "usage": {"input_tokens": 312, "output_tokens": 48}
+}$$;
+SELECT * FROM typesafe_classify(
+	'Help! My payouts have been failing for 3 days.',
+	'Which team should handle this?',
+	'{"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}'::jsonb);
+  choice   | confidence |                    probabilities                    |   model    | input_tokens | output_tokens 
+-----------+------------+-----------------------------------------------------+------------+--------------+---------------
+ technical |       0.82 | {"sales": 0.07, "billing": 0.08, "technical": 0.85} | jev-latest |          312 |            48
+(1 row)
+
+SELECT typesafe_label(
+	'Help! My payouts have been failing for 3 days.',
+	'Which team should handle this?',
+	'{"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}'::jsonb);
+ typesafe_label 
+----------------
+ technical
+(1 row)
+
+SELECT typesafe_last_request();
+                                                                                                                                                       typesafe_last_request                                                                                                                                                       
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"state": "Help! My payouts have been failing for 3 days.", "model": "jev-latest", "questions": {"label": {"type": "choice", "instructions": "Which team should handle this?", "criteria": {"sales": "Pricing, upgrades, new accounts", "billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations"}}}}
+(1 row)
+
+-- Detect urgency (Noul)
+SET typesafe.mock_response = $${
+  "model": "jev-latest",
+  "answers": {
+    "flag": {
+      "type": "noul",
+      "noul": 0.92
+    }
+  },
+  "usage": {"input_tokens": 312, "output_tokens": 48}
+}$$;
+SELECT * FROM typesafe_detect(
+	'Help! My payouts have been failing for 3 days.',
+	'Does this convey urgency?',
+	'Explicitly time-sensitive',
+	'No urgency expressed');
+ noul |   model    | input_tokens | output_tokens 
+------+------------+--------------+---------------
+ 0.92 | jev-latest |          312 |            48
+(1 row)
+
+-- Score frustration (Score)
+SET typesafe.mock_response = $${
+  "model": "jev-latest",
+  "answers": {
+    "rating": {
+      "type": "score",
+      "score": 1.6,
+      "confidence": 0.78,
+      "legend": {"0": "Calm", "1": "Frustrated", "2": "Very angry"},
+      "probabilities": {"0": 0.05, "1": 0.3, "2": 0.65}
+    }
+  },
+  "usage": {"input_tokens": 312, "output_tokens": 48}
+}$$;
+SELECT * FROM typesafe_score(
+	'Help! My payouts have been failing for 3 days.',
+	'How frustrated is the customer?',
+	ARRAY['Calm', 'Frustrated', 'Very angry']);
+ score | confidence |                       legend                        |          probabilities           |   model    | input_tokens | output_tokens 
+-------+------------+-----------------------------------------------------+----------------------------------+------------+--------------+---------------
+   1.6 |       0.78 | {"0": "Calm", "1": "Frustrated", "2": "Very angry"} | {"0": 0.05, "1": 0.3, "2": 0.65} | jev-latest |          312 |            48
+(1 row)
+
+-- Ask two questions (choice + noul)
+SET typesafe.mock_response = $${
+  "model": "jev-latest",
+  "answers": {
+    "department": {
+      "type": "choice",
+      "choice": "technical",
+      "confidence": 0.82,
+      "probabilities": {
+        "billing": 0.08,
+        "technical": 0.85,
+        "sales": 0.07
+      }
+    },
+    "is_urgent": {
+      "type": "noul",
+      "noul": 0.92
+    }
+  },
+  "usage": {"input_tokens": 312, "output_tokens": 48}
+}$$;
+SELECT jsonb_object_keys(typesafe_ask(
+	'{"ticket": "Help! My payouts have been failing for 3 days."}'::jsonb,
+	'{"department": {"type": "choice", "instructions": "Which team should handle this?", "criteria": {"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}}, "is_urgent": {"type": "noul", "instructions": "Does this convey urgency?"}}'::jsonb)->'answers') AS answer_key
+ORDER BY 1;
+ answer_key 
+------------
+ department
+ is_urgent
+(2 rows)
+
+-- Batch detect (one TypeSafe request, many Nouls)
+SET typesafe.mock_response = $${
+  "model": "jev-latest",
+  "answers": {
+    "s0": {"type": "noul", "noul": 0.91},
+    "s1": {"type": "noul", "noul": 0.02}
+  },
+  "usage": {"input_tokens": 400, "output_tokens": 24}
+}$$;
+SELECT ordinality, state, noul
+FROM typesafe_detect_many(
+	ARRAY[
+		'The Department of Sanitation couldn''t find the condition.',
+		'The City has removed the graffiti from this property.'
+	],
+	'Does this resolution say the condition could not be found?');
+ ordinality |                           state                           | noul 
+------------+-----------------------------------------------------------+------
+          1 | The Department of Sanitation couldn't find the condition. | 0.91
+          2 | The City has removed the graffiti from this property.     | 0.02
+(2 rows)
+
+SELECT typesafe_last_request() LIKE '%"s0"%' AND typesafe_last_request() LIKE '%"s1"%' AS packed_two_questions;
+ packed_two_questions 
+----------------------
+ t
+(1 row)
+
+SELECT ordinality, noul IS NULL AS noul_is_null
+FROM typesafe_detect_many(
+	ARRAY['The Department of Sanitation couldn''t find the condition.', NULL, 'The City has removed the graffiti from this property.'],
+	'Does this resolution say the condition could not be found?')
+ORDER BY ordinality;
+ ordinality | noul_is_null 
+------------+--------------
+          1 | f
+          2 | t
+          3 | f
+(3 rows)
+
+-- Batch classify
+SET typesafe.mock_response = $${
+  "model": "jev-latest",
+  "answers": {
+    "s0": {
+      "type": "choice",
+      "choice": "technical",
+      "confidence": 0.82,
+      "probabilities": {"billing": 0.08, "technical": 0.85, "sales": 0.07}
+    },
+    "s1": {
+      "type": "choice",
+      "choice": "billing",
+      "confidence": 0.70,
+      "probabilities": {"billing": 0.70, "technical": 0.20, "sales": 0.10}
+    }
+  },
+  "usage": {"input_tokens": 400, "output_tokens": 24}
+}$$;
+SELECT ordinality, choice
+FROM typesafe_classify_many(
+	ARRAY[
+		'Help! My payouts have been failing for 3 days.',
+		'I was charged twice, where is my refund?'
+	],
+	'Which team should handle this?',
+	'{"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}'::jsonb)
+ORDER BY ordinality;
+ ordinality |  choice   
+------------+-----------
+          1 | technical
+          2 | billing
+(2 rows)
+
+-- NULL state
+SELECT typesafe_classify(
+	NULL,
+	'Which team should handle this?',
+	'{"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}'::jsonb);
+ERROR:  state must not be null
+-- options must be a JSON object, not an array
+SELECT typesafe_classify(
+	'Help! My payouts have been failing for 3 days.',
+	'Which team should handle this?',
+	'["billing", "technical", "sales"]'::jsonb);
+ERROR:  options must be a JSON object
+-- levels must have at least two elements
+SELECT typesafe_score(
+	'Help! My payouts have been failing for 3 days.',
+	'How frustrated is the customer?',
+	ARRAY['Calm']);
+ERROR:  levels must be a one-dimensional array with at least two non-null elements
+-- empty mock_response and empty api_key
+SET typesafe.mock_response = '';
+SET typesafe.api_key = '';
+SELECT typesafe_classify(
+	'Help! My payouts have been failing for 3 days.',
+	'Which team should handle this?',
+	'{"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}'::jsonb);
+ERROR:  typesafe.api_key is not set
