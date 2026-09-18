@@ -24,6 +24,8 @@
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
+#include "storage/latch.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -31,7 +33,9 @@
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/timestamp.h"
 #include "utils/tuplestore.h"
+#include "utils/wait_event.h"
 #include "varatt.h"
 
 #ifdef PG_MODULE_MAGIC_EXT
@@ -59,9 +63,13 @@ PG_FUNCTION_INFO_V1(typesafe_classify_many);
 #define TYPESAFE_USER_AGENT_HDR	"User-Agent: postgres-typesafe/1.0"
 #define TYPESAFE_BODY_TRUNC		1024
 #define TYPESAFE_MAX_RETRIES		3
+#define TYPESAFE_MAX_RESPONSE_BYTES	(8 * 1024 * 1024)
+#define TYPESAFE_RETRY_MAX_WAIT_MS	60000
+#define TYPESAFE_WAIT_QUANTUM_MS	200
 
 /* GUC variables */
 static char *typesafe_api_key = NULL;
+static char *typesafe_api_key_file = NULL;
 static char *typesafe_endpoint = NULL;
 static char *typesafe_model = NULL;
 static int	typesafe_timeout_ms = 30000;
@@ -82,6 +90,11 @@ static void save_last_request(const char *body);
 static size_t write_callback(char *ptr, size_t size, size_t nmemb,
 							 void *userdata);
 static char *truncate_body(const char *body, int len);
+static void check_endpoint(const char *endpoint);
+static void setup_easy_handle(CURL *curl, struct curl_slist *headers,
+							  const char *payload, StringInfo response,
+							  int idx);
+static char **http_post_live(char **requests, int nrequests);
 static char *http_post_json(const char *request_json);
 static char *execute_request(const char *request_json);
 static void append_request_prelude(StringInfo buf, const char *state_text,
@@ -122,8 +135,19 @@ _PG_init(void)
 							   NULL,
 							   &typesafe_api_key,
 							   "",
-							   PGC_USERSET,
+							   PGC_SUSET,
 							   GUC_NO_SHOW_ALL | GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE,
+							   NULL,
+							   NULL,
+							   NULL);
+
+	DefineCustomStringVariable("typesafe.api_key_file",
+							   "File holding the TypeSafe API key (first line).",
+							   NULL,
+							   &typesafe_api_key_file,
+							   "",
+							   PGC_SUSET,
+							   GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE,
 							   NULL,
 							   NULL,
 							   NULL);
@@ -259,7 +283,8 @@ resolve_model(FunctionCallInfo fcinfo, int argno)
 }
 
 /*
- * GUC, then TYPESAFE_API_KEY.  Never log the value.
+ * GUC, then typesafe.api_key_file, then TYPESAFE_API_KEY.  Never log the
+ * value.
  */
 static const char *
 resolve_api_key(void)
@@ -268,6 +293,39 @@ resolve_api_key(void)
 
 	if (typesafe_api_key != NULL && typesafe_api_key[0] != '\0')
 		return typesafe_api_key;
+
+	if (typesafe_api_key_file != NULL && typesafe_api_key_file[0] != '\0')
+	{
+		FILE	   *f;
+		char		line[512];
+		char	   *key = NULL;
+
+		f = AllocateFile(typesafe_api_key_file, "r");
+		if (f == NULL)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open typesafe.api_key_file \"%s\": %m",
+							typesafe_api_key_file)));
+		if (fgets(line, sizeof(line), f) != NULL)
+		{
+			int			len = strlen(line);
+
+			while (len > 0 &&
+				   (line[len - 1] == '\n' || line[len - 1] == '\r' ||
+					line[len - 1] == ' ' || line[len - 1] == '	'))
+				line[--len] = '\0';
+			if (len > 0)
+				key = pstrdup(line);
+		}
+		FreeFile(f);
+
+		if (key == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("typesafe.api_key_file \"%s\" is empty",
+							typesafe_api_key_file)));
+		return key;
+	}
 
 	env = getenv("TYPESAFE_API_KEY");
 	if (env != NULL && env[0] != '\0')
@@ -296,6 +354,13 @@ write_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
 	StringInfo	buf = (StringInfo) userdata;
 	size_t		nbytes = size * nmemb;
 
+	/* Refuse to buffer absurdly large responses; curl aborts the transfer. */
+	if ((size_t) buf->len + nbytes > TYPESAFE_MAX_RESPONSE_BYTES)
+	{
+		buf->cursor = 1;		/* flag: aborted due to size cap */
+		return 0;
+	}
+
 	appendBinaryStringInfo(buf, ptr, nbytes);
 	return nbytes;
 }
@@ -323,24 +388,159 @@ append_header(struct curl_slist *headers, const char *line)
 }
 
 /*
- * POST request_json to typesafe.endpoint.  Retries HTTP 429 and 529 up to
- * three extra times.  Does not log the API key.
+ * Reject endpoints that are not https://, except plain http:// to loopback
+ * hosts (used by tests).  Defense in depth for SSRF/scheme confusion.
  */
-static char *
-http_post_json(const char *request_json)
+static void
+check_endpoint(const char *endpoint)
 {
-	CURL	   *volatile curl = NULL;
-	struct curl_slist *volatile headers = NULL;
-	StringInfoData response;
-	const char *apikey;
-	char	   *volatile result = NULL;
+	if (endpoint == NULL || endpoint[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("typesafe.endpoint is not set")));
 
+	if (pg_strncasecmp(endpoint, "https://", 8) == 0)
+		return;
+
+	if (pg_strncasecmp(endpoint, "http://127.0.0.1", 16) == 0 ||
+		pg_strncasecmp(endpoint, "http://localhost", 16) == 0 ||
+		pg_strncasecmp(endpoint, "http://[::1]", 12) == 0)
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("typesafe.endpoint must use https (or http to localhost): %s",
+					endpoint)));
+}
+
+/*
+ * Common per-transfer options.  idx rides in CURLOPT_PRIVATE so the multi
+ * loop can map a finished handle back to its slot.
+ */
+static void
+setup_easy_handle(CURL *curl, struct curl_slist *headers,
+				  const char *payload, StringInfo response, int idx)
+{
+	if (curl_easy_setopt(curl, CURLOPT_URL, typesafe_endpoint) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_POST, 1L) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
+						 (long) strlen(payload)) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
+						 (long) typesafe_timeout_ms) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L) != CURLE_OK ||
+#if LIBCURL_VERSION_NUM >= 0x075500	/* 7.85.0 */
+		curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https") != CURLE_OK ||
+#else
+		curl_easy_setopt(curl, CURLOPT_PROTOCOLS,
+						 CURLPROTO_HTTP | CURLPROTO_HTTPS) != CURLE_OK ||
+#endif
+		curl_easy_setopt(curl, CURLOPT_HTTP_VERSION,
+						 (long) CURL_HTTP_VERSION_2TLS) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+						 (curl_write_callback) write_callback) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, response) != CURLE_OK ||
+		curl_easy_setopt(curl, CURLOPT_PRIVATE,
+						 (char *) (intptr_t) idx) != CURLE_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not configure HTTP client")));
+}
+
+/*
+ * Backoff before retry attempt 'attempt' (1-based), honoring the server's
+ * Retry-After when libcurl exposes it.  Milliseconds, capped.
+ */
+static long
+retry_delay_ms(CURL *eh, int attempt)
+{
+	long		delay = 200L * (1L << (attempt - 1));
+
+#ifdef CURLINFO_RETRY_AFTER
+	{
+		curl_off_t	ra = 0;
+
+		if (curl_easy_getinfo(eh, CURLINFO_RETRY_AFTER, &ra) == CURLE_OK &&
+			ra > 0)
+		{
+			if (ra > TYPESAFE_RETRY_MAX_WAIT_MS / 1000)
+				ra = TYPESAFE_RETRY_MAX_WAIT_MS / 1000;
+			if (ra * 1000 > delay)
+				delay = (long) ra * 1000;
+		}
+	}
+#endif
+
+	if (delay > TYPESAFE_RETRY_MAX_WAIT_MS)
+		delay = TYPESAFE_RETRY_MAX_WAIT_MS;
+	return delay;
+}
+
+/* Per-slot transfer state for http_post_live. */
+typedef enum
+{
+	TS_SLOT_PENDING,			/* not yet started (or waiting on retry) */
+	TS_SLOT_IN_FLIGHT,
+	TS_SLOT_DONE
+} ts_slot_state;
+
+/*
+ * POST nrequests bodies to typesafe.endpoint via curl_multi, at most
+ * typesafe.http_concurrency in flight.  Retries HTTP 429/529 per handle
+ * without stalling other transfers, stays responsive to query cancel
+ * (CHECK_FOR_INTERRUPTS between waits, latch-based sleeps), and never
+ * logs the API key.  Returns palloc'd response bodies in request order.
+ */
+static char **
+http_post_live(char **requests, int nrequests)
+{
+	char	  **results;
+	CURLM	   *volatile multi = NULL;
+	struct curl_slist *volatile headers = NULL;
+	CURL	  **volatile easies = NULL;
+	StringInfoData *responses;
+	const char **payloads;
+	int		   *attempts;
+	TimestampTz *retry_at;
+	ts_slot_state *slots;
+	int			concurrency;
+	int			in_flight = 0;
+	int			ndone = 0;
+	const char *apikey;
+	int			i;
+
+	results = (char **) palloc0(sizeof(char *) * nrequests);
+	if (nrequests <= 0)
+		return results;
+
+	check_endpoint(typesafe_endpoint);
 	apikey = resolve_api_key();
 
-	initStringInfo(&response);
+	concurrency = typesafe_http_concurrency;
+	if (concurrency > nrequests)
+		concurrency = nrequests;
 
-	curl = curl_easy_init();
-	if (curl == NULL)
+	easies = (CURL **) palloc0(sizeof(CURL *) * nrequests);
+	responses = (StringInfoData *) palloc(sizeof(StringInfoData) * nrequests);
+	payloads = (const char **) palloc(sizeof(char *) * nrequests);
+	attempts = (int *) palloc0(sizeof(int) * nrequests);
+	retry_at = (TimestampTz *) palloc0(sizeof(TimestampTz) * nrequests);
+	slots = (ts_slot_state *) palloc0(sizeof(ts_slot_state) * nrequests);
+
+	for (i = 0; i < nrequests; i++)
+	{
+		initStringInfo(&responses[i]);
+		payloads[i] = pg_server_to_any(requests[i], strlen(requests[i]),
+									   PG_UTF8);
+	}
+
+	multi = curl_multi_init();
+	if (multi == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("could not initialize HTTP client")));
@@ -348,93 +548,209 @@ http_post_json(const char *request_json)
 	PG_TRY();
 	{
 		char	   *auth;
-		const char *payload;
-		CURLcode	rc;
-		long		status;
-		int			attempt;
 
 		headers = append_header(NULL, "Content-Type: application/json");
 		headers = append_header(headers, "Accept: application/json");
 		headers = append_header(headers, TYPESAFE_USER_AGENT_HDR);
+		/* suppress libcurl's Expect: 100-continue round trip */
+		headers = append_header(headers, "Expect:");
 
 		auth = psprintf("Authorization: Bearer %s", apikey);
 		headers = append_header(headers, auth);
 		pfree(auth);
 
-		payload = pg_server_to_any(request_json, strlen(request_json), PG_UTF8);
-
-		if (curl_easy_setopt(curl, CURLOPT_URL, typesafe_endpoint) != CURLE_OK ||
-			curl_easy_setopt(curl, CURLOPT_POST, 1L) != CURLE_OK ||
-			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers) != CURLE_OK ||
-			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload) != CURLE_OK ||
-			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
-							 (long) strlen(payload)) != CURLE_OK ||
-			curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
-							 (long) typesafe_timeout_ms) != CURLE_OK ||
-			curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L) != CURLE_OK ||
-			curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) != CURLE_OK ||
-			curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L) != CURLE_OK ||
-			curl_easy_setopt(curl, CURLOPT_HTTP_VERSION,
-							 (long) CURL_HTTP_VERSION_2TLS) != CURLE_OK ||
-			curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
-							 (curl_write_callback) write_callback) != CURLE_OK ||
-			curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response) != CURLE_OK)
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("could not configure HTTP client")));
-
-		for (attempt = 0;; attempt++)
+		while (ndone < nrequests)
 		{
-			resetStringInfo(&response);
+			TimestampTz now;
+			int			still_running = 0;
+			CURLMsg    *msg;
+			int			left;
+			bool		waiting_retry = false;
+			long		sleep_ms;
 
-			rc = curl_easy_perform(curl);
-			if (rc != CURLE_OK)
-				ereport(ERROR,
-						(errcode(ERRCODE_CONNECTION_FAILURE),
-						 errmsg("typesafe HTTP request failed: %s",
-								curl_easy_strerror(rc))));
+			CHECK_FOR_INTERRUPTS();
 
-			status = 0;
-			rc = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-			if (rc != CURLE_OK)
-				ereport(ERROR,
-						(errcode(ERRCODE_CONNECTION_FAILURE),
-						 errmsg("typesafe HTTP request failed: %s",
-								curl_easy_strerror(rc))));
+			now = GetCurrentTimestamp();
 
-			if (status == 200)
-				break;
-
-			if ((status == 429 || status == 529) &&
-				attempt < TYPESAFE_MAX_RETRIES)
+			/* Launch pending slots whose retry deadline (if any) passed. */
+			for (i = 0; i < nrequests && in_flight < concurrency; i++)
 			{
-				CHECK_FOR_INTERRUPTS();
-				pg_usleep(200000L * (1L << attempt));
-				CHECK_FOR_INTERRUPTS();
-				continue;
+				if (slots[i] != TS_SLOT_PENDING)
+					continue;
+				if (retry_at[i] != 0 && retry_at[i] > now)
+					continue;
+
+				if (easies[i] == NULL)
+				{
+					easies[i] = curl_easy_init();
+					if (easies[i] == NULL)
+						ereport(ERROR,
+								(errcode(ERRCODE_CONNECTION_FAILURE),
+								 errmsg("could not initialize HTTP client")));
+					setup_easy_handle(easies[i], headers, payloads[i],
+									  &responses[i], i);
+				}
+
+				resetStringInfo(&responses[i]);
+				responses[i].cursor = 0;	/* clear size-cap abort flag */
+				if (curl_multi_add_handle(multi, easies[i]) != CURLM_OK)
+					ereport(ERROR,
+							(errcode(ERRCODE_CONNECTION_FAILURE),
+							 errmsg("could not start HTTP request")));
+				slots[i] = TS_SLOT_IN_FLIGHT;
+				in_flight++;
 			}
 
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("typesafe HTTP request failed with status %ld: %s",
-							status,
-							truncate_body(response.data, response.len))));
-		}
+			if (curl_multi_perform(multi, &still_running) != CURLM_OK)
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("typesafe HTTP request failed")));
 
-		result = pg_any_to_server(response.data, response.len, PG_UTF8);
-		if (result == response.data)
-			result = pstrdup(response.data);
+			while ((msg = curl_multi_info_read(multi, &left)) != NULL)
+			{
+				int			idx;
+				char	   *priv = NULL;
+				long		status = 0;
+				CURL	   *eh;
+
+				if (msg->msg != CURLMSG_DONE)
+					continue;
+
+				eh = msg->easy_handle;
+				curl_easy_getinfo(eh, CURLINFO_PRIVATE, &priv);
+				idx = (int) (intptr_t) priv;
+
+				if (msg->data.result != CURLE_OK)
+				{
+					if (msg->data.result == CURLE_WRITE_ERROR &&
+						responses[idx].cursor == 1)
+						ereport(ERROR,
+								(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+								 errmsg("typesafe HTTP response exceeds %d bytes",
+										TYPESAFE_MAX_RESPONSE_BYTES)));
+					ereport(ERROR,
+							(errcode(ERRCODE_CONNECTION_FAILURE),
+							 errmsg("typesafe HTTP request failed: %s",
+									curl_easy_strerror(msg->data.result))));
+				}
+
+				curl_easy_getinfo(eh, CURLINFO_RESPONSE_CODE, &status);
+				curl_multi_remove_handle(multi, eh);
+				in_flight--;
+
+				if (status == 200)
+				{
+					char	   *converted;
+
+					converted = pg_any_to_server(responses[idx].data,
+												 responses[idx].len,
+												 PG_UTF8);
+					if (converted == responses[idx].data)
+						converted = pstrdup(responses[idx].data);
+					results[idx] = converted;
+					curl_easy_cleanup(eh);
+					easies[idx] = NULL;
+					slots[idx] = TS_SLOT_DONE;
+					ndone++;
+					continue;
+				}
+
+				if ((status == 429 || status == 529) &&
+					attempts[idx] < TYPESAFE_MAX_RETRIES)
+				{
+					long		delay;
+
+					attempts[idx]++;
+					delay = retry_delay_ms(eh, attempts[idx]);
+					retry_at[idx] =
+						TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+													delay);
+					slots[idx] = TS_SLOT_PENDING;
+					continue;
+				}
+
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("typesafe HTTP request failed with status %ld: %s",
+								status,
+								truncate_body(responses[idx].data,
+											  responses[idx].len))));
+			}
+
+			if (ndone >= nrequests)
+				break;
+
+			/* Anything parked on a retry deadline? */
+			sleep_ms = TYPESAFE_WAIT_QUANTUM_MS;
+			now = GetCurrentTimestamp();
+			for (i = 0; i < nrequests; i++)
+			{
+				if (slots[i] == TS_SLOT_PENDING && retry_at[i] != 0)
+				{
+					long		ms;
+
+					waiting_retry = true;
+					ms = (long) ((retry_at[i] - now) / 1000);
+					if (ms < 1)
+						ms = 1;
+					if (ms < sleep_ms)
+						sleep_ms = ms;
+				}
+			}
+
+			if (in_flight > 0)
+			{
+				int			numfds = 0;
+
+				/*
+				 * Short quantum keeps us responsive to cancel even though
+				 * curl_multi_wait does not watch the process latch.
+				 */
+				curl_multi_wait(multi, NULL, 0, (int) sleep_ms, &numfds);
+			}
+			else if (waiting_retry)
+			{
+				(void) WaitLatch(MyLatch,
+								 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+								 sleep_ms,
+								 PG_WAIT_EXTENSION);
+				ResetLatch(MyLatch);
+			}
+		}
 	}
 	PG_FINALLY();
 	{
+		if (multi != NULL)
+		{
+			for (i = 0; i < nrequests; i++)
+			{
+				if (easies != NULL && easies[i] != NULL)
+				{
+					curl_multi_remove_handle(multi, easies[i]);
+					curl_easy_cleanup(easies[i]);
+					easies[i] = NULL;
+				}
+			}
+			curl_multi_cleanup(multi);
+		}
 		if (headers != NULL)
 			curl_slist_free_all(headers);
-		if (curl != NULL)
-			curl_easy_cleanup(curl);
 	}
 	PG_END_TRY();
 
-	return result;
+	return results;
+}
+
+/*
+ * POST one request body.  Same interrupt-safe machinery as the batch path.
+ */
+static char *
+http_post_json(const char *request_json)
+{
+	char	  **results;
+
+	results = http_post_live((char **) &request_json, 1);
+	return results[0];
 }
 
 static char *
@@ -1205,9 +1521,8 @@ append_noul_criteria(StringInfo buf, const char *true_meaning,
 }
 
 /*
- * POST several request bodies.  One request uses execute_request (and
- * mock_response).  Several live requests overlap with curl_multi, up to
- * typesafe.http_concurrency in flight.
+ * POST several request bodies.  Mocked requests go through execute_request;
+ * live ones share http_post_live's interrupt-safe multi loop.
  */
 static char **
 http_post_many(char **requests, int nrequests)
@@ -1215,14 +1530,12 @@ http_post_many(char **requests, int nrequests)
 	char	  **results;
 	int			i;
 
-	results = (char **) palloc0(sizeof(char *) * nrequests);
-
 	if (nrequests <= 0)
-		return results;
+		return (char **) palloc0(sizeof(char *) * 1);
 
-	if (nrequests == 1 ||
-		(typesafe_mock_response != NULL && typesafe_mock_response[0] != '\0'))
+	if (typesafe_mock_response != NULL && typesafe_mock_response[0] != '\0')
 	{
+		results = (char **) palloc0(sizeof(char *) * nrequests);
 		for (i = 0; i < nrequests; i++)
 			results[i] = execute_request(requests[i]);
 		return results;
@@ -1230,195 +1543,7 @@ http_post_many(char **requests, int nrequests)
 
 	save_last_request(requests[nrequests - 1]);
 
-	{
-		CURLM	   *volatile multi = NULL;
-		struct curl_slist *volatile headers = NULL;
-		CURL	  **volatile easies = NULL;
-		StringInfoData *volatile responses = NULL;
-		const char **volatile payloads = NULL;
-		int		   *volatile attempts = NULL;
-		int			concurrency;
-		int			next = 0;
-		int			in_flight = 0;
-		int			ndone = 0;
-		const char *apikey;
-		char	   *auth;
-
-		apikey = resolve_api_key();
-		concurrency = typesafe_http_concurrency;
-		if (concurrency > nrequests)
-			concurrency = nrequests;
-
-		easies = (CURL **) palloc0(sizeof(CURL *) * nrequests);
-		responses = (StringInfoData *) palloc(sizeof(StringInfoData) * nrequests);
-		payloads = (const char **) palloc(sizeof(char *) * nrequests);
-		attempts = (int *) palloc0(sizeof(int) * nrequests);
-
-		for (i = 0; i < nrequests; i++)
-		{
-			initStringInfo(&responses[i]);
-			payloads[i] = pg_server_to_any(requests[i], strlen(requests[i]),
-										   PG_UTF8);
-		}
-
-		multi = curl_multi_init();
-		if (multi == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("could not initialize HTTP client")));
-
-		PG_TRY();
-		{
-			headers = append_header(NULL, "Content-Type: application/json");
-			headers = append_header(headers, "Accept: application/json");
-			headers = append_header(headers, TYPESAFE_USER_AGENT_HDR);
-			auth = psprintf("Authorization: Bearer %s", apikey);
-			headers = append_header(headers, auth);
-			pfree(auth);
-
-			while (ndone < nrequests)
-			{
-				int			still_running = 0;
-				int			numfds = 0;
-				CURLMsg    *msg;
-				int			left;
-
-				CHECK_FOR_INTERRUPTS();
-
-				while (in_flight < concurrency && next < nrequests)
-				{
-					CURL	   *curl = curl_easy_init();
-
-					if (curl == NULL)
-						ereport(ERROR,
-								(errcode(ERRCODE_CONNECTION_FAILURE),
-								 errmsg("could not initialize HTTP client")));
-
-					resetStringInfo(&responses[next]);
-					if (curl_easy_setopt(curl, CURLOPT_URL, typesafe_endpoint) != CURLE_OK ||
-						curl_easy_setopt(curl, CURLOPT_POST, 1L) != CURLE_OK ||
-						curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers) != CURLE_OK ||
-						curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payloads[next]) != CURLE_OK ||
-						curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
-										 (long) strlen(payloads[next])) != CURLE_OK ||
-						curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
-										 (long) typesafe_timeout_ms) != CURLE_OK ||
-						curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L) != CURLE_OK ||
-						curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) != CURLE_OK ||
-						curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L) != CURLE_OK ||
-						curl_easy_setopt(curl, CURLOPT_HTTP_VERSION,
-										 (long) CURL_HTTP_VERSION_2TLS) != CURLE_OK ||
-						curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
-										 (curl_write_callback) write_callback) != CURLE_OK ||
-						curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responses[next]) != CURLE_OK ||
-						curl_easy_setopt(curl, CURLOPT_PRIVATE, (char *) (intptr_t) next) != CURLE_OK)
-						ereport(ERROR,
-								(errcode(ERRCODE_CONNECTION_FAILURE),
-								 errmsg("could not configure HTTP client")));
-
-					easies[next] = curl;
-					if (curl_multi_add_handle(multi, curl) != CURLM_OK)
-						ereport(ERROR,
-								(errcode(ERRCODE_CONNECTION_FAILURE),
-								 errmsg("could not start HTTP request")));
-					next++;
-					in_flight++;
-				}
-
-				if (curl_multi_perform(multi, &still_running) != CURLM_OK)
-					ereport(ERROR,
-							(errcode(ERRCODE_CONNECTION_FAILURE),
-							 errmsg("typesafe HTTP request failed")));
-
-				if (still_running > 0)
-					curl_multi_wait(multi, NULL, 0, 1000, &numfds);
-
-				while ((msg = curl_multi_info_read(multi, &left)) != NULL)
-				{
-					int			idx = -1;
-					char	   *priv = NULL;
-					long		status = 0;
-					CURL	   *eh;
-
-					if (msg->msg != CURLMSG_DONE)
-						continue;
-
-					eh = msg->easy_handle;
-					curl_easy_getinfo(eh, CURLINFO_PRIVATE, &priv);
-					idx = (int) (intptr_t) priv;
-
-					if (msg->data.result != CURLE_OK)
-						ereport(ERROR,
-								(errcode(ERRCODE_CONNECTION_FAILURE),
-								 errmsg("typesafe HTTP request failed: %s",
-										curl_easy_strerror(msg->data.result))));
-
-					curl_easy_getinfo(eh, CURLINFO_RESPONSE_CODE, &status);
-					curl_multi_remove_handle(multi, eh);
-
-					if (status == 200)
-					{
-						char	   *converted;
-
-						converted = pg_any_to_server(responses[idx].data,
-													 responses[idx].len,
-													 PG_UTF8);
-						if (converted == responses[idx].data)
-							converted = pstrdup(responses[idx].data);
-						results[idx] = converted;
-						curl_easy_cleanup(eh);
-						easies[idx] = NULL;
-						in_flight--;
-						ndone++;
-						continue;
-					}
-
-					if ((status == 429 || status == 529) &&
-						attempts[idx] < TYPESAFE_MAX_RETRIES)
-					{
-						attempts[idx]++;
-						CHECK_FOR_INTERRUPTS();
-						pg_usleep(200000L * (1L << (attempts[idx] - 1)));
-						CHECK_FOR_INTERRUPTS();
-						resetStringInfo(&responses[idx]);
-						if (curl_multi_add_handle(multi, eh) != CURLM_OK)
-							ereport(ERROR,
-									(errcode(ERRCODE_CONNECTION_FAILURE),
-									 errmsg("could not retry HTTP request")));
-						continue;
-					}
-
-					ereport(ERROR,
-							(errcode(ERRCODE_CONNECTION_FAILURE),
-							 errmsg("typesafe HTTP request failed with status %ld: %s",
-									status,
-									truncate_body(responses[idx].data,
-												  responses[idx].len))));
-				}
-			}
-		}
-		PG_FINALLY();
-		{
-			if (multi != NULL)
-			{
-				for (i = 0; i < nrequests; i++)
-				{
-					if (easies != NULL && easies[i] != NULL)
-					{
-						curl_multi_remove_handle(multi, easies[i]);
-						curl_easy_cleanup(easies[i]);
-						easies[i] = NULL;
-					}
-				}
-				curl_multi_cleanup(multi);
-			}
-			if (headers != NULL)
-				curl_slist_free_all(headers);
-		}
-		PG_END_TRY();
-	}
-
-	return results;
+	return http_post_live(requests, nrequests);
 }
 
 static char *
@@ -1571,7 +1696,6 @@ typesafe_detect_many(PG_FUNCTION_ARGS)
 	int			nchunks;
 	char	  **chunk_reqs;
 	char	  **chunk_bodies;
-	int		   *chunk_off;
 	int		   *chunk_len;
 	int			c;
 	int			batch;
@@ -1605,7 +1729,6 @@ typesafe_detect_many(PG_FUNCTION_ARGS)
 		nchunks = 0;
 
 	chunk_reqs = (char **) palloc(sizeof(char *) * Max(nchunks, 1));
-	chunk_off = (int *) palloc(sizeof(int) * Max(nchunks, 1));
 	chunk_len = (int *) palloc(sizeof(int) * Max(nchunks, 1));
 
 	for (c = 0; c < nchunks; c++)
@@ -1613,7 +1736,6 @@ typesafe_detect_many(PG_FUNCTION_ARGS)
 		int			off = c * batch;
 		int			len = Min(batch, nwork - off);
 
-		chunk_off[c] = off;
 		chunk_len[c] = len;
 		chunk_reqs[c] = build_detect_chunk(texts + off, len, instructions,
 										   true_meaning, false_meaning, model);
@@ -1648,10 +1770,16 @@ typesafe_detect_many(PG_FUNCTION_ARGS)
 				snprintf(qid, sizeof(qid), "s%d", j);
 				nouls[work_i] = noul_from_qid(resp, qid);
 				models[work_i] = rmodel;
+
+				/*
+				 * Usage is per HTTP request, not per item; report it on
+				 * the chunk's first row only so SUM() over the result is
+				 * accurate.
+				 */
 				in_toks[work_i] = in_tok;
 				out_toks[work_i] = out_tok;
-				in_nulls[work_i] = in_null;
-				out_nulls[work_i] = out_null;
+				in_nulls[work_i] = in_null || (j > 0);
+				out_nulls[work_i] = out_null || (j > 0);
 				work_i++;
 			}
 		}
@@ -1786,10 +1914,16 @@ typesafe_classify_many(PG_FUNCTION_ARGS)
 				choice_from_qid(resp, qid, &choices[work_i], &confs[work_i],
 								&probs[work_i]);
 				models[work_i] = rmodel;
+
+				/*
+				 * Usage is per HTTP request, not per item; report it on
+				 * the chunk's first row only so SUM() over the result is
+				 * accurate.
+				 */
 				in_toks[work_i] = in_tok;
 				out_toks[work_i] = out_tok;
-				in_nulls[work_i] = in_null;
-				out_nulls[work_i] = out_null;
+				in_nulls[work_i] = in_null || (j > 0);
+				out_nulls[work_i] = out_null || (j > 0);
 				work_i++;
 			}
 		}

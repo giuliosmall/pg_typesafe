@@ -130,6 +130,20 @@ FROM typesafe_detect_many(
 	'Does this resolution say the condition could not be found?')
 ORDER BY ordinality;
 
+-- usage is per HTTP request: reported on each chunk's first row only
+SELECT ordinality, input_tokens, output_tokens
+FROM typesafe_detect_many(
+	ARRAY[
+		'The Department of Sanitation couldn''t find the condition.',
+		'The City has removed the graffiti from this property.'
+	],
+	'Does this resolution say the condition could not be found?')
+ORDER BY ordinality;
+
+-- typesafe_noul is NULL-safe on state and instructions
+SELECT typesafe_noul(NULL, 'Does this convey urgency?') IS NULL AS null_state,
+       typesafe_noul('Some text', NULL) IS NULL AS null_instructions;
+
 -- Batch classify
 SET typesafe.mock_response = $${
   "model": "jev-latest",

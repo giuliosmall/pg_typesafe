@@ -37,6 +37,15 @@ export TYPESAFE_API_KEY=tsk_...
 pg_ctl restart
 ```
 
+Alternatively point `typesafe.api_key_file` (superuser-only GUC) at a file whose
+first line is the key — this keeps the key out of SQL, logs, and
+`postgresql.auto.conf`:
+
+```sql
+ALTER SYSTEM SET typesafe.api_key_file = '/etc/postgresql/typesafe.key';
+SELECT pg_reload_conf();
+```
+
 ```sql
 SELECT typesafe_noul(
     'Help! My payouts have been failing for 3 days.',
@@ -44,7 +53,13 @@ SELECT typesafe_noul(
 );
 ```
 
-`SET typesafe.api_key` works for a session but appears in query logs.
+`SET typesafe.api_key` works for a session (superuser only) but appears in query logs.
+
+`typesafe.endpoint` must be `https://`; plain `http://` is allowed only toward
+localhost (used by the test suite). Responses are capped at 8 MB. HTTP 429/529
+are retried up to 3 times per request with exponential backoff, honoring
+`Retry-After`. Requests remain cancellable (Ctrl-C, `statement_timeout`) while
+in flight.
 
 ## Demo (NYC 311)
 
@@ -89,6 +104,10 @@ FROM typesafe_detect_many(
 ```
 
 `typesafe.batch_size` (default 32) is how many texts share one TypeSafe request. Extra chunks overlap (`typesafe.http_concurrency`, default 4).
+
+In `*_many` results, `input_tokens`/`output_tokens` are per HTTP request and
+reported on each chunk's **first row only** (NULL on the rest), so
+`SUM(input_tokens)` over the result is the true total.
 
 ## Tests without the network
 

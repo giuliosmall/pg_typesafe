@@ -155,8 +155,12 @@ CREATE FUNCTION typesafe_noul(
 )
 RETURNS double precision
 AS $$
-	SELECT noul
-	FROM typesafe_detect(state, instructions, true_meaning, false_meaning, model);
+	SELECT CASE
+		WHEN state IS NULL OR instructions IS NULL THEN NULL
+		ELSE (SELECT noul
+			  FROM typesafe_detect(state, instructions, true_meaning,
+								   false_meaning, model))
+	END;
 $$ LANGUAGE SQL VOLATILE PARALLEL UNSAFE;
 
 -- Outbound HTTP spends the server's TypeSafe quota. Owner only by default.
