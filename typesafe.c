@@ -192,7 +192,7 @@ _PG_init(void)
 							   NULL,
 							   &typesafe_mock_response,
 							   "",
-							   PGC_USERSET,
+							   PGC_SUSET,
 							   0,
 							   NULL,
 							   NULL,
@@ -205,7 +205,7 @@ _PG_init(void)
 							32,
 							1,
 							128,
-							PGC_USERSET,
+							PGC_SUSET,
 							0,
 							NULL,
 							NULL,
@@ -218,7 +218,7 @@ _PG_init(void)
 							4,
 							1,
 							16,
-							PGC_USERSET,
+							PGC_SUSET,
 							0,
 							NULL,
 							NULL,
@@ -671,10 +671,11 @@ http_post_live(char **requests, int nrequests)
 
 				ereport(ERROR,
 						(errcode(ERRCODE_CONNECTION_FAILURE),
-						 errmsg("typesafe HTTP request failed with status %ld: %s",
-								status,
-								truncate_body(responses[idx].data,
-											  responses[idx].len))));
+						 errmsg("typesafe HTTP request failed with status %ld",
+								status),
+						 errdetail("Response body (truncated): %s",
+								   truncate_body(responses[idx].data,
+												 responses[idx].len))));
 			}
 
 			if (ndone >= nrequests)

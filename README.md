@@ -69,7 +69,7 @@ From the repo root, with the key in the server environment:
 psql -d postgres -v ON_ERROR_STOP=1 -f examples/311.sql
 ```
 
-1,000 closed NYC 311 complaints, **38 unique** resolution strings. `typesafe_detect_many` classifies those 38 in one TypeSafe request (not 1,000 HTTP calls).
+1,000 closed NYC 311 complaints, **38 unique** resolution strings. `typesafe_detect_many` classifies those 38 in two TypeSafe requests at the default `typesafe.batch_size = 32` (not 1,000 HTTP calls).
 
 Measured on a laptop against live Jev:
 
@@ -110,6 +110,10 @@ reported on each chunk's **first row only** (NULL on the rest), so
 `SUM(input_tokens)` over the result is the true total.
 
 ## Tests without the network
+
+`typesafe.mock_response` short-circuits the HTTP call and returns the given
+body verbatim. It is superuser-only: a granted app role must not be able to
+forge classification answers.
 
 ```sql
 SET typesafe.mock_response = $${

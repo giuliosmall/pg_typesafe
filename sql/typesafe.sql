@@ -205,5 +205,9 @@ DROP ROLE IF EXISTS typesafe_nobody;
 CREATE ROLE typesafe_nobody NOLOGIN;
 SET SESSION AUTHORIZATION typesafe_nobody;
 SELECT typesafe_noul('x', 'y');
+-- a granted role must not be able to forge answers (issue #1)
+SET typesafe.mock_response = '{"model":"x","answers":{"flag":{"type":"noul","noul":0.0}}}';
+SET typesafe.batch_size = 128;
+SET typesafe.http_concurrency = 16;
 RESET SESSION AUTHORIZATION;
 DROP ROLE typesafe_nobody;

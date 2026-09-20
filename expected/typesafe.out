@@ -258,5 +258,12 @@ CREATE ROLE typesafe_nobody NOLOGIN;
 SET SESSION AUTHORIZATION typesafe_nobody;
 SELECT typesafe_noul('x', 'y');
 ERROR:  permission denied for function typesafe_noul
+-- a granted role must not be able to forge answers (issue #1)
+SET typesafe.mock_response = '{"model":"x","answers":{"flag":{"type":"noul","noul":0.0}}}';
+ERROR:  permission denied to set parameter "typesafe.mock_response"
+SET typesafe.batch_size = 128;
+ERROR:  permission denied to set parameter "typesafe.batch_size"
+SET typesafe.http_concurrency = 16;
+ERROR:  permission denied to set parameter "typesafe.http_concurrency"
 RESET SESSION AUTHORIZATION;
 DROP ROLE typesafe_nobody;
