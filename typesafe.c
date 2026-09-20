@@ -461,7 +461,7 @@ retry_delay_ms(CURL *eh, int attempt)
 {
 	long		delay = 200L * (1L << (attempt - 1));
 
-#ifdef CURLINFO_RETRY_AFTER
+#if LIBCURL_VERSION_NUM >= 0x074200	/* 7.66.0: CURLINFO_RETRY_AFTER (enum, not #ifdef-able) */
 	{
 		curl_off_t	ra = 0;
 

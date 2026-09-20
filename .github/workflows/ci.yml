@@ -7,28 +7,47 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install PostgreSQL 16 and libcurl
+      - name: Install PostgreSQL ${{ matrix.pg }} and libcurl
         run: |
           sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg
+          # pgdg has every major version regardless of the Ubuntu image default
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            postgresql-16 \
-            postgresql-server-dev-16 \
+            postgresql-${{ matrix.pg }} \
+            postgresql-server-dev-${{ matrix.pg }} \
             libcurl4-openssl-dev \
+            libipc-run-perl \
             pkg-config \
             gcc \
             make
 
       - name: Build and install extension
         run: |
-          make with_llvm=no PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
-          sudo make with_llvm=no PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install
+          make with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          sudo make with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config install
 
       - name: Mock tests
         run: |
-          sudo pg_ctlcluster 16 main start || true
+          sudo pg_ctlcluster ${{ matrix.pg }} main start || true
           sudo -u postgres createdb typesafe_ci
           sudo -u postgres env PGHOST=/var/run/postgresql PGUSER=postgres PGDATABASE=typesafe_ci \
             sh test/ci.sh
+
+      - name: Regression + TAP tests
+        run: |
+          sudo -u postgres env PGHOST=/var/run/postgresql PGUSER=postgres \
+            make with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config installcheck \
+            || { cat regression.diffs 2>/dev/null; find tmp_check -name '*.log' -exec tail -50 {} + 2>/dev/null; exit 1; }

@@ -201,7 +201,9 @@ SELECT typesafe_classify(
 	'{"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}'::jsonb);
 
 -- EXECUTE is revoked from PUBLIC
+SET client_min_messages = warning;  -- role may pre-exist in shared clusters
 DROP ROLE IF EXISTS typesafe_nobody;
+RESET client_min_messages;
 CREATE ROLE typesafe_nobody NOLOGIN;
 SET SESSION AUTHORIZATION typesafe_nobody;
 SELECT typesafe_noul('x', 'y');
