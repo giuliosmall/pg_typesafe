@@ -41,13 +41,16 @@ jobs:
 
       - name: Mock tests
         run: |
-          sudo pg_ctlcluster ${{ matrix.pg }} main start || true
+          # the runner image may ship its own cluster on 5432; start clean
+          for v in 14 15 16 17 18; do sudo pg_dropcluster --stop $v main 2>/dev/null || true; done
+          sudo pg_createcluster -p 5432 ${{ matrix.pg }} main --start
           sudo -u postgres createdb typesafe_ci
           sudo -u postgres env PGHOST=/var/run/postgresql PGUSER=postgres PGDATABASE=typesafe_ci \
             sh test/ci.sh
 
       - name: Regression + TAP tests
         run: |
+          sudo chown -R postgres "$PWD"
           sudo -u postgres env PGHOST=/var/run/postgresql PGUSER=postgres \
             make with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config installcheck \
             || { cat regression.diffs 2>/dev/null; find tmp_check -name '*.log' -exec tail -50 {} + 2>/dev/null; exit 1; }
