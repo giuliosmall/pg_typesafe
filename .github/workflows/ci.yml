@@ -105,10 +105,11 @@ jobs:
       - name: Build and install extension
         run: |
           export PATH=/opt/homebrew/opt/postgresql@17/bin:$PATH
-          # pg_config's CFLAGS carry -fexcess-precision=standard, which older
-          # clang warns about; don't let -Werror promote that noise
-          make COPT="-Werror -Wno-ignored-optimization-argument"
-          make COPT="-Werror -Wno-ignored-optimization-argument" install
+          # pg_config's CFLAGS carry flags from the clang Homebrew built
+          # with; the runner's older clang warns about them, so keep
+          # -Werror from promoting that mismatch noise
+          make COPT="-Werror -Wno-ignored-optimization-argument -Wno-unknown-warning-option"
+          make COPT="-Werror -Wno-ignored-optimization-argument -Wno-unknown-warning-option" install
 
       - name: Regression tests
         run: |
