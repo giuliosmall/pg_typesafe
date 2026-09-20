@@ -105,13 +105,15 @@ jobs:
       - name: Build and install extension
         run: |
           export PATH=/opt/homebrew/opt/postgresql@17/bin:$PATH
-          make COPT=-Werror
-          make COPT=-Werror install
+          # pg_config's CFLAGS carry -fexcess-precision=standard, which older
+          # clang warns about; don't let -Werror promote that noise
+          make COPT="-Werror -Wno-ignored-optimization-argument"
+          make COPT="-Werror -Wno-ignored-optimization-argument" install
 
       - name: Regression tests
         run: |
           export PATH=/opt/homebrew/opt/postgresql@17/bin:$PATH LC_ALL=C LANG=C
           initdb -D /tmp/data --locale=C -U postgres
           pg_ctl -D /tmp/data -l /tmp/pg.log -o "-k /tmp -c listen_addresses=" start
-          PGHOST=/tmp make COPT=-Werror installcheck PGUSER=postgres \
+          PGHOST=/tmp make installcheck PGUSER=postgres \
             || { cat regression.diffs 2>/dev/null; exit 1; }
