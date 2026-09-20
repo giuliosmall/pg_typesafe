@@ -3,6 +3,10 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    # weekly bit-rot check: distro, libcurl, and PG minor updates land
+    # without any push to this repo
+    - cron: '17 6 * * 1'
 
 jobs:
   test:
@@ -11,6 +15,8 @@ jobs:
       fail-fast: false
       matrix:
         pg: [16, 17]
+        sanitize: [0, 1]
+    name: "pg${{ matrix.pg }}${{ matrix.sanitize == 1 && ' (asan+ubsan)' || '' }}"
     steps:
       - uses: actions/checkout@v4
 
@@ -34,16 +40,35 @@ jobs:
             gcc \
             make
 
+      - name: Set build flags
+        run: |
+          if [ "${{ matrix.sanitize }}" = 1 ]; then
+            echo "COPT=-Werror -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -Og" >> "$GITHUB_ENV"
+            LIBASAN=$(gcc -print-file-name=libasan.so)
+            LIBUBSAN=$(gcc -print-file-name=libubsan.so)
+            # server is uninstrumented: preload sanitizer runtimes into
+            # every backend; leak detection off (would flag the server
+            # allocator itself)
+            echo "SRV_ENV=LD_PRELOAD=$LIBASAN:$LIBUBSAN ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:log_path=/tmp/asan UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:log_path=/tmp/ubsan" >> "$GITHUB_ENV"
+          else
+            echo "COPT=-Werror" >> "$GITHUB_ENV"
+            echo "SRV_ENV=" >> "$GITHUB_ENV"
+          fi
+
       - name: Build and install extension
         run: |
-          make with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
-          sudo make with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config install
+          make COPT="$COPT" with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          sudo make COPT="$COPT" with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config install
 
       - name: Mock tests
         run: |
-          # the runner image may ship its own cluster on 5432; start clean
+          # the packaged cluster auto-starts on 5432; remove it, then use a
+          # hand-rolled cluster so sanitizer runtimes can be preloaded
+          # into every backend (mirrors test/docker_check.sh)
           for v in 14 15 16 17 18; do sudo pg_dropcluster --stop $v main 2>/dev/null || true; done
-          sudo pg_createcluster -p 5432 ${{ matrix.pg }} main --start
+          sudo -u postgres env $SRV_ENV /usr/lib/postgresql/${{ matrix.pg }}/bin/initdb -D /tmp/data --locale=C
+          sudo -u postgres env $SRV_ENV /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_ctl -D /tmp/data -l /tmp/pg.log \
+            -o "-k /var/run/postgresql -c listen_addresses=" start
           sudo -u postgres createdb typesafe_ci
           sudo -u postgres env PGHOST=/var/run/postgresql PGUSER=postgres PGDATABASE=typesafe_ci \
             sh test/ci.sh
@@ -53,6 +78,40 @@ jobs:
           sudo chown -R postgres "$PWD"
           # let the postgres user traverse into the workspace
           sudo chmod o+rx /home/runner /home/runner/work "$(dirname "$PWD")"
-          sudo -u postgres env PGHOST=/var/run/postgresql PGUSER=postgres \
-            make with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config installcheck \
+          sudo -u postgres env PGHOST=/var/run/postgresql PGUSER=postgres $SRV_ENV \
+            make COPT="$COPT" with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config installcheck \
             || { cat regression.diffs 2>/dev/null; find tmp_check -name '*.log' -exec tail -50 {} + 2>/dev/null; exit 1; }
+
+      - name: Check sanitizer reports
+        if: matrix.sanitize == 1
+        run: |
+          if ls /tmp/asan.* /tmp/ubsan.* 2>/dev/null; then
+            echo "=== SANITIZER REPORTS ==="
+            cat /tmp/asan.* /tmp/ubsan.* 2>/dev/null
+            exit 1
+          fi
+          echo "no sanitizer reports"
+
+  test-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 17
+        run: |
+          brew install postgresql@17
+          echo "/opt/homebrew/opt/postgresql@17/bin" >> "$GITHUB_PATH"
+
+      - name: Build and install extension
+        run: |
+          export PATH=/opt/homebrew/opt/postgresql@17/bin:$PATH
+          make COPT=-Werror
+          make COPT=-Werror install
+
+      - name: Regression tests
+        run: |
+          export PATH=/opt/homebrew/opt/postgresql@17/bin:$PATH LC_ALL=C LANG=C
+          initdb -D /tmp/data --locale=C -U postgres
+          pg_ctl -D /tmp/data -l /tmp/pg.log -o "-k /tmp -c listen_addresses=" start
+          PGHOST=/tmp make COPT=-Werror installcheck PGUSER=postgres \
+            || { cat regression.diffs 2>/dev/null; exit 1; }
