@@ -51,6 +51,8 @@ jobs:
       - name: Regression + TAP tests
         run: |
           sudo chown -R postgres "$PWD"
+          # let the postgres user traverse into the workspace
+          sudo chmod o+rx /home/runner /home/runner/work "$(dirname "$PWD")"
           sudo -u postgres env PGHOST=/var/run/postgresql PGUSER=postgres \
             make with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config installcheck \
             || { cat regression.diffs 2>/dev/null; find tmp_check -name '*.log' -exec tail -50 {} + 2>/dev/null; exit 1; }
