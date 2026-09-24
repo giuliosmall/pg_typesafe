@@ -1,0 +1,6 @@
+*
+!Makefile
+!typesafe.c
+!typesafe.control
+!typesafe--*.sql
+!docker/

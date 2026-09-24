@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [16, 17]
+        pg: [15, 16, 17, 18]
         sanitize: [0, 1]
     name: "pg${{ matrix.pg }}${{ matrix.sanitize == 1 && ' (asan+ubsan)' || '' }}"
     steps:
@@ -92,6 +92,77 @@ jobs:
           fi
           echo "no sanitizer reports"
 
+  installer:
+    # the one-liner, as a user would run it, on a stock runner: build
+    # dependencies come from the package manager, the key is stored via --db
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 18]
+    runs-on: ubuntu-latest
+    name: "install.sh pg${{ matrix.pg }}"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ matrix.pg }} server only
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl ca-certificates
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-${{ matrix.pg }}
+          for v in 14 15 16 17 18; do sudo pg_dropcluster --stop $v main 2>/dev/null || true; done
+          sudo pg_createcluster ${{ matrix.pg }} main --start
+
+      - name: Run install.sh
+        run: |
+          sudo TYPESAFE_API_KEY=tsk_ci_dummy sh install.sh --source \
+            --pg-config /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config --db postgres
+
+      - name: Verify
+        run: |
+          q() { sudo -u postgres psql -X -v ON_ERROR_STOP=1 -Atc "$1"; }
+          q "SELECT extversion FROM pg_extension WHERE extname = 'typesafe'"
+          f=$(q "SHOW typesafe.api_key_file")
+          test "$(sudo cat "$f")" = tsk_ci_dummy
+          # key is resolved: the call gets as far as the (unreachable) endpoint
+          out=$(sudo -u postgres psql -X -Atc "SET typesafe.endpoint = 'http://127.0.0.1:9/'" \
+            -c "SELECT typesafe_noul('a', 'b')" 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "HTTP request failed"
+          # the key never reached the server log
+          if sudo grep -rq tsk_ci_dummy /var/log/postgresql/; then exit 1; fi
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t pg_typesafe:ci .
+      - name: Extension is enabled out of the box
+        run: |
+          docker run -d --name pg -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=app pg_typesafe:ci
+          for i in $(seq 60); do
+            docker exec pg pg_isready -U postgres -d app -h 127.0.0.1 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec pg psql -U postgres -d app -v ON_ERROR_STOP=1 \
+            -c "SET typesafe.mock_response = '{\"model\":\"m\",\"answers\":{\"flag\":{\"type\":\"noul\",\"noul\":0.5}},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'" \
+            -c "SELECT typesafe_noul('a', 'b')"
+          docker exec pg psql -U postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE later" \
+            -d postgres
+          test "$(docker exec pg psql -U postgres -d later -Atc "SELECT count(*) FROM pg_extension WHERE extname = 'typesafe'")" = 1
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -s sh install.sh scripts/package-binary.sh docker/initdb-typesafe.sh test/ci.sh
+
   test-macos:
     runs-on: macos-14
     steps:
@@ -118,3 +189,8 @@ jobs:
           pg_ctl -D /tmp/data -l /tmp/pg.log -o "-k /tmp -c listen_addresses=" start
           PGHOST=/tmp make installcheck PGUSER=postgres \
             || { cat regression.diffs 2>/dev/null; exit 1; }
+
+      - name: install.sh
+        run: |
+          PGHOST=/tmp PGUSER=postgres sh install.sh --source \
+            --pg-config /opt/homebrew/opt/postgresql@17/bin/pg_config --db postgres
