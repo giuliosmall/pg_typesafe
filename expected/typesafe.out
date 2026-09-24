@@ -251,6 +251,7 @@ SELECT typesafe_classify(
 	'Which team should handle this?',
 	'{"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}'::jsonb);
 ERROR:  typesafe.api_key is not set
+HINT:  Set TYPESAFE_API_KEY in the server environment, or point typesafe.api_key_file at a file holding the key.
 -- EXECUTE is revoked from PUBLIC
 SET client_min_messages = warning;  -- role may pre-exist in shared clusters
 DROP ROLE IF EXISTS typesafe_nobody;
