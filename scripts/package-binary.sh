@@ -10,6 +10,8 @@ set -eu
 
 PGC=${1:?pg_config path}
 OUT=${2:?output directory}
+mkdir -p "$OUT"
+OUT=$(cd "$OUT" && pwd)	# we cd into a staging tree below
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 
 major=$("$PGC" --version | sed -n 's/^PostgreSQL \([0-9][0-9]*\).*/\1/p')

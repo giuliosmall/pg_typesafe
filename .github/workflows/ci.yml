@@ -137,6 +137,16 @@ jobs:
           # the key never reached the server log
           if sudo grep -rq tsk_ci_dummy /var/log/postgresql/; then exit 1; fi
 
+      - name: Prebuilt path (as release.yml packages and install.sh consumes it)
+        run: |
+          sh scripts/package-binary.sh /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config dist
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          cd /tmp
+          sudo TYPESAFE_RELEASE_URL="file://$GITHUB_WORKSPACE/dist" \
+            sh "$GITHUB_WORKSPACE/install.sh" --pg-config /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config \
+            --db postgres 2>&1 | tee /tmp/install.log
+          grep -q "installed prebuilt" /tmp/install.log
+
   docker:
     strategy:
       fail-fast: false
