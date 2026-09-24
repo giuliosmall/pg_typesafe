@@ -36,7 +36,13 @@
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 #include "utils/wait_event.h"
+#if PG_VERSION_NUM >= 160000
 #include "varatt.h"
+#endif
+
+#if PG_VERSION_NUM < 150000
+#error "pg_typesafe requires PostgreSQL 15 or later"
+#endif
 
 #ifdef PG_MODULE_MAGIC_EXT
 PG_MODULE_MAGIC_EXT(
@@ -45,6 +51,11 @@ PG_MODULE_MAGIC_EXT(
 );
 #else
 PG_MODULE_MAGIC;
+#endif
+
+/* fmgr.h declares this itself from PG16 on */
+#if PG_VERSION_NUM < 160000
+void		_PG_init(void);
 #endif
 
 PG_FUNCTION_INFO_V1(typesafe_classify);
@@ -80,7 +91,12 @@ static int	typesafe_http_concurrency = 4;
 /* Last POST body, allocated in TopMemoryContext. */
 static char *last_request_json = NULL;
 
+/* PG18 replaced the postfix attribute with a prefix one */
+#ifdef pg_noreturn
+pg_noreturn static void json_shape_error(const char *detail);
+#else
 static void json_shape_error(const char *detail) pg_attribute_noreturn();
+#endif
 static char *get_text_arg(FunctionCallInfo fcinfo, int argno, const char *name);
 static Jsonb *get_jsonb_arg(FunctionCallInfo fcinfo, int argno,
 							const char *name);
@@ -333,7 +349,8 @@ resolve_api_key(void)
 
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("typesafe.api_key is not set")));
+			 errmsg("typesafe.api_key is not set"),
+			 errhint("Set TYPESAFE_API_KEY in the server environment, or point typesafe.api_key_file at a file holding the key.")));
 	return NULL;				/* keep compiler quiet */
 }
 
