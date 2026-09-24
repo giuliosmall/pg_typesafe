@@ -1,6 +1,8 @@
 # pg_typesafe
 
 [![ci](https://github.com/giuliosmall/pg_typesafe/actions/workflows/ci.yml/badge.svg)](https://github.com/giuliosmall/pg_typesafe/actions/workflows/ci.yml)
+[![PGXN version](https://badge.fury.io/pg/typesafe.svg)](https://pgxn.org/dist/typesafe/)
+[![release](https://img.shields.io/github/v/release/giuliosmall/pg_typesafe)](https://github.com/giuliosmall/pg_typesafe/releases/latest)
 
 **Pre-alpha.** A PostgreSQL extension that calls [TypeSafe AI](https://console.typesafe.ai/home) (System One / Jev) from SQL for categorical work: Choice, Noul, and Score.
 
@@ -75,14 +77,13 @@ secrets:
 
 ### PGXN
 
-Coming soon: the PGXN release is pending account approval. Once published:
-
 ```bash
 pgxn install typesafe
 ```
 
-Until then, use the one-liner, Docker, or the source zip attached to the
-[latest release](https://github.com/giuliosmall/pg_typesafe/releases/latest).
+Builds from source with the [PGXN client](https://pgxn.github.io/pgxnclient/)
+(`pip install pgxnclient`); needs the same headers as a source build below.
+Listing: [pgxn.org/dist/typesafe](https://pgxn.org/dist/typesafe/).
 
 ### From source
 
