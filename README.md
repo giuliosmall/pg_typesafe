@@ -75,9 +75,14 @@ secrets:
 
 ### PGXN
 
+Coming soon: the PGXN release is pending account approval. Once published:
+
 ```bash
 pgxn install typesafe
 ```
+
+Until then, use the one-liner, Docker, or the source zip attached to the
+[latest release](https://github.com/giuliosmall/pg_typesafe/releases/latest).
 
 ### From source
 
