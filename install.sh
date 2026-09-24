@@ -381,6 +381,8 @@ if [ -n "$DB" ]; then
 		case "$key" in *'\'*|*'	'*) die "TYPESAFE_API_KEY contains unexpected characters" ;; esac
 		{
 			cat <<-'SQL'
+			-- PG15 rejects ALTER SYSTEM on a custom GUC until its module is loaded
+			LOAD 'typesafe';
 			CREATE TEMP TABLE typesafe_key_tmp (k text);
 			COPY typesafe_key_tmp FROM STDIN;
 			SQL

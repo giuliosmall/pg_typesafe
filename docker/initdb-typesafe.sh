@@ -13,7 +13,8 @@ for db in template1 "${POSTGRES_DB:-$POSTGRES_USER}"; do
 done
 
 if [ -n "${TYPESAFE_API_KEY_FILE:-}" ]; then
-	echo "ALTER SYSTEM SET typesafe.api_key_file = :'keyfile';" \
+	# PG15 rejects ALTER SYSTEM on a custom GUC until its module is loaded
+	printf '%s\n' "LOAD 'typesafe';" "ALTER SYSTEM SET typesafe.api_key_file = :'keyfile';" \
 		| psql -X -q -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --no-password \
 			--dbname postgres -v keyfile="$TYPESAFE_API_KEY_FILE"
 fi
